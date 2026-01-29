@@ -9,10 +9,10 @@ import tensorflow as tf
 import datetime as dt
 import time
 
-# Force Plotly to use a visible theme
+# Force Plotly to use a visible theme for Streamlit Cloud
 pio.templates.default = "plotly_white"
 
-# 1. Improved Data Fetching (Fixes the Multi-Index Graph Bug)
+# 1. Improved Data Fetching (Fixes Multi-Index Graph Bug)
 @st.cache_data(ttl=1800)
 def fetch_stock_data(ticker, days_back=2000):
     end = dt.date.today()
@@ -22,11 +22,11 @@ def fetch_stock_data(ticker, days_back=2000):
         if df.empty:
             return pd.DataFrame()
         
-        # FIX: Flatten Multi-Index columns if they exist
+        # FIX: Flatten Multi-Index columns if they exist (yfinance 0.2.x+ behavior)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         
-        # Ensure 'Close' is a Series and not a DataFrame
+        # Ensure 'Close' is treated as a single column Series
         if isinstance(df['Close'], pd.DataFrame):
             df['Close'] = df['Close'].iloc[:, 0]
             
@@ -39,20 +39,21 @@ def fetch_stock_data(ticker, days_back=2000):
 @st.cache_resource(show_spinner=False)
 def load_model():
     try:
+        # File must be in the root of your GitHub repo
         return tf.keras.models.load_model('lstm_stock_model.h5')
     except Exception as e:
-        st.error(f"Model load failed: {e}. Ensure 'lstm_stock_model.h5' is in your repo.")
+        st.error(f"Model load failed: {e}. Check if 'lstm_stock_model.h5' is uploaded.")
         return None
 
 # --- UI Setup ---
 st.set_page_config(page_title="NSE Stock Predictor", layout="wide")
 st.title("📈 Indian Stock Market Predictor (NSE)")
-st.caption("LSTM Neural Network Demo • Skips Weekends for Predictions")
+st.caption("LSTM Neural Network • Handles Weekends • Interactive Plotly Charts")
 
 model = load_model()
 
 if model is None:
-    st.info("Please upload your 'lstm_stock_model.h5' file to the GitHub repository.")
+    st.warning("Application stopped: Model file missing.")
     st.stop()
 
 stocks_dict = {
@@ -63,43 +64,49 @@ stocks_dict = {
     "Nifty 50 Index": "^NSEI"
 }
 
-# Sidebar for controls
+# Sidebar for user controls
+st.sidebar.header("Settings")
 selected = st.sidebar.selectbox("Select Stock", list(stocks_dict.keys()), index=0)
 ticker = stocks_dict[selected]
 future_days = st.sidebar.slider("Days to Predict", 1, 30, 10)
 
 if st.sidebar.button("Generate Prediction", type="primary"):
-    with st.spinner(f"Processing {selected}..."):
+    with st.spinner(f"Analyzing {selected}..."):
         df = fetch_stock_data(ticker)
         
         if df.empty or len(df) < 100:
-            st.error("Not enough data. Try a different ticker or check your connection.")
+            st.error("Insufficient data found for this ticker.")
         else:
-            # Display Metrics
+            # Current Price Metrics
             curr = df['Close'].iloc[-1]
             prev = df['Close'].iloc[-2]
             st.metric(f"Current {selected} Price", f"₹{curr:,.2f}", f"{curr-prev:,.2f}")
 
-            # Scaling
+            # Prepare Scaling
             close_prices = df['Close'].values.reshape(-1, 1)
             scaler = MinMaxScaler(feature_range=(0, 1))
             scaled = scaler.fit_transform(close_prices)
             
-            # --- PREDICTION LOGIC ---
+            # --- FIXED PREDICTION LOGIC (Fixes ValueError) ---
             last_60 = scaled[-60:].reshape(1, 60, 1)
             preds_scaled = []
             temp_batch = last_60.copy()
             
             for _ in range(future_days):
+                # Predict next value
                 p = model.predict(temp_batch, verbose=0)
                 preds_scaled.append(p[0, 0])
-                # Roll the window
-                temp_batch = np.append(temp_batch[:, 1:, :], [p.reshape(1, 1, 1)], axis=1)
+                
+                # Reshape prediction to match batch dimensions (1, 1, 1)
+                p_reshaped = p.reshape(1, 1, 1)
+                
+                # Slide window: Remove oldest, add newest prediction
+                temp_batch = np.concatenate((temp_batch[:, 1:, :], p_reshaped), axis=1)
             
+            # Transform back to actual price
             preds = scaler.inverse_transform(np.array(preds_scaled).reshape(-1, 1))
             
-            # REMEMBER WEEKEND DATA: Use Business Day range (bdate_range)
-            # This ensures your prediction dates skip Saturdays and Sundays
+            # WEEKEND LOGIC: Use Business Day range to skip Saturdays/Sundays
             future_dates = pd.bdate_range(start=df.index[-1] + pd.Timedelta(days=1), periods=future_days)
 
             # --- VISUALIZATION ---
@@ -107,32 +114,37 @@ if st.sidebar.button("Generate Prediction", type="primary"):
 
             with col1:
                 fig = go.Figure()
-                # Historical
+                # Historical Price Trace
                 fig.add_trace(go.Scatter(
                     x=df.index[-150:], 
                     y=df['Close'][-150:],
-                    name='Historical', line=dict(color='#1f77b4')
+                    name='Historical', 
+                    line=dict(color='#1f77b4', width=2)
                 ))
-                # Prediction
+                # Prediction Trace
                 fig.add_trace(go.Scatter(
                     x=future_dates, 
                     y=preds.flatten(),
-                    name='Predicted', line=dict(color='orange', dash='dash', width=3)
+                    name='Predicted', 
+                    line=dict(color='#ff7f0e', dash='dash', width=3)
                 ))
                 fig.update_layout(
                     title=f"{selected} Price Forecast",
-                    xaxis_title="Date", yaxis_title="Price (₹)",
-                    height=500, hovermode="x unified"
+                    xaxis_title="Date", 
+                    yaxis_title="Price (₹)",
+                    height=550, 
+                    hovermode="x unified",
+                    template="plotly_white"
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
             with col2:
-                st.subheader("Forecast Table")
+                st.subheader("Price Table")
                 pred_df = pd.DataFrame({
-                    'Date': future_dates.strftime('%Y-%m-%d'),
+                    'Date': future_dates.strftime('%d %b, %Y'),
                     'Price (₹)': preds.flatten().round(2)
                 })
                 st.dataframe(pred_df, use_container_width=True, hide_index=True)
 
 else:
-    st.info("Select a stock and click 'Generate Prediction' to begin.")
+    st.info("Select a stock from the sidebar and click 'Generate Prediction'.")
